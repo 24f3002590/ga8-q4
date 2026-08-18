@@ -14,36 +14,6 @@ INTERVENTIONS = [
     "qlora",
 ]
 
-CHOOSE_CODES = [
-    "INVALID_INPUT",
-    "UNAVAILABLE",
-    "QUALITY_FLOOR",
-    "FRESHNESS_REQUIRED",
-    "LATENCY_LIMIT",
-    "MEMORY_LIMIT",
-    "DATA_LIMIT",
-    "COST_LIMIT",
-]
-
-REPAIR_CODES = [
-    "INVALID_TOKEN",
-    "INVALID_PARAMETER",
-    "CHAT_TEMPLATE_COUNT",
-    "INFERENCE_MODE",
-    "FULL_MODEL_ARTIFACT",
-    "ADAPTER_FILE_SET",
-    "INCOMPLETE_CHECKPOINT",
-    "MUTABLE_BASE_REVISION",
-    "LINEAGE_MISMATCH",
-    "EFFECTIVE_BATCH_MISMATCH",
-    "EVAL_LEAKAGE",
-    "EVAL_DROPOUT_ACTIVE",
-    "RESUME_DIVERGENCE",
-]
-
-HEX40 = re.compile(r"^[0-9a-f]{40}$")
-HEX64 = re.compile(r"^[0-9a-f]{64}$")
-
 REQUIRED_POLICY = {
     "minQuality",
     "freshnessRequired",
@@ -66,13 +36,12 @@ REQUIRED_CANDIDATE = {
     "recurringCost",
 }
 
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
 
 def utf8_sort(values):
-    return sorted(values, key=lambda x: x.encode("utf-8"))
-
-
-def unique_utf8(values):
-    return utf8_sort(set(values))
+    return sorted(set(values), key=lambda x: x.encode("utf-8"))
 
 
 def safe_int(v):
@@ -99,19 +68,15 @@ def finite_nonnegative(v):
     return finite_number(v) and float(v) >= 0
 
 
-def finite_probability(v):
+def probability(v):
     return finite_number(v) and 0 <= float(v) <= 1
 
 
-def read_json_safely(request):
-    return request.json()
-
-
-# ---------------------------------------------------------
+# ============================================================
 # CHOOSE
-# ---------------------------------------------------------
+# ============================================================
 
-async def choose(body):
+def choose(body):
     policy = body.get("policy")
     candidates = body.get("candidates")
 
@@ -127,53 +92,53 @@ async def choose(body):
     if not isinstance(policy["freshnessRequired"], bool):
         return None
 
-    if not finite_probability(policy["minQuality"]):
+    if not probability(policy["minQuality"]):
         return None
 
-    for k in (
+    for key in (
         "maxLatencyMs",
         "maxMemoryMb",
         "maxTotalCost",
     ):
-        if not finite_nonnegative(policy[k]):
+        if not finite_nonnegative(policy[key]):
             return None
 
-    for k in (
+    for key in (
         "maxLabeledExamples",
         "horizonRequests",
     ):
-        if not safe_int(policy[k]):
+        if not safe_int(policy[key]):
             return None
 
     names = []
 
-    for c in candidates:
-        if not isinstance(c, dict):
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
             return None
 
-        if set(c.keys()) != REQUIRED_CANDIDATE:
+        if set(candidate.keys()) != REQUIRED_CANDIDATE:
             return None
 
-        names.append(c["name"])
+        names.append(candidate["name"])
 
     if set(names) != set(INTERVENTIONS):
         return None
 
-    if len(names) != len(set(names)):
+    if len(set(names)) != 4:
         return None
+
+    by_name = {c["name"]: c for c in candidates}
 
     min_quality = float(policy["minQuality"])
     freshness_required = policy["freshnessRequired"]
     max_latency = float(policy["maxLatencyMs"])
     max_memory = float(policy["maxMemoryMb"])
     max_labeled = policy["maxLabeledExamples"]
-    max_cost = float(policy["maxTotalCost"])
+    max_total_cost = float(policy["maxTotalCost"])
     horizon = policy["horizonRequests"]
 
-    by_name = {c["name"]: c for c in candidates}
-
     total_costs = {}
-    reasons = {}
+    reason_codes = {}
     eligible = []
 
     for name in INTERVENTIONS:
@@ -185,19 +150,19 @@ async def choose(body):
         if not isinstance(c["available"], bool):
             valid = False
 
-        if not finite_probability(c["quality"]):
+        if not probability(c["quality"]):
             valid = False
 
         if not isinstance(c["freshness"], bool):
             valid = False
 
-        for k in (
+        for key in (
             "latencyMs",
             "memoryMb",
             "oneTimeCost",
             "recurringCost",
         ):
-            if not finite_nonnegative(c[k]):
+            if not finite_nonnegative(c[key]):
                 valid = False
 
         if not safe_int(c["labeledExamples"]):
@@ -206,23 +171,23 @@ async def choose(body):
         if not valid:
             codes.append("INVALID_INPUT")
             total_costs[name] = None
-            reasons[name] = unique_utf8(codes)
+            reason_codes[name] = utf8_sort(codes)
             continue
 
-        cost = (
+        total = (
             float(c["oneTimeCost"])
             + float(horizon) * float(c["recurringCost"])
         )
 
-        if not math.isfinite(cost) or cost < 0:
+        if not math.isfinite(total):
             codes.append("INVALID_INPUT")
             total_costs[name] = None
-            reasons[name] = unique_utf8(codes)
+            reason_codes[name] = utf8_sort(codes)
             continue
 
-        total_costs[name] = round(cost, 12)
+        total_costs[name] = round(total, 12)
 
-        if not c["available"]:
+        if c["available"] is not True:
             codes.append("UNAVAILABLE")
 
         if float(c["quality"]) < min_quality:
@@ -240,12 +205,13 @@ async def choose(body):
         if c["labeledExamples"] > max_labeled:
             codes.append("DATA_LIMIT")
 
-        if cost > max_cost:
+        if total > max_total_cost:
             codes.append("COST_LIMIT")
 
-        reasons[name] = unique_utf8(codes)
+        codes = utf8_sort(codes)
+        reason_codes[name] = codes
 
-        if not codes:
+        if len(codes) == 0:
             eligible.append(name)
 
     return {
@@ -256,26 +222,23 @@ async def choose(body):
             for name in INTERVENTIONS
         },
         "reasonCodes": {
-            name: reasons[name]
+            name: reason_codes[name]
             for name in INTERVENTIONS
         },
     }
 
 
-# ---------------------------------------------------------
-# REPAIR
-# ---------------------------------------------------------
+# ============================================================
+# TOKENS
+# ============================================================
 
 def validate_tokens(tokens):
     if not isinstance(tokens, list) or len(tokens) == 0:
         return False, []
 
-    valid = True
-
     for token in tokens:
         if not isinstance(token, dict):
-            valid = False
-            break
+            return False, [-100] * len(tokens)
 
         if set(token.keys()) != {
             "id",
@@ -283,31 +246,23 @@ def validate_tokens(tokens):
             "padding",
             "text",
         }:
-            valid = False
-            break
+            return False, [-100] * len(tokens)
 
         if not safe_int(token["id"]):
-            valid = False
-            break
+            return False, [-100] * len(tokens)
 
         if token["role"] not in {
             "system",
             "user",
             "assistant",
         }:
-            valid = False
-            break
+            return False, [-100] * len(tokens)
 
         if not isinstance(token["padding"], bool):
-            valid = False
-            break
+            return False, [-100] * len(tokens)
 
         if not isinstance(token["text"], str):
-            valid = False
-            break
-
-    if not valid:
-        return False, [-100] * len(tokens)
+            return False, [-100] * len(tokens)
 
     labels = []
 
@@ -323,96 +278,85 @@ def validate_tokens(tokens):
     return True, labels
 
 
+# ============================================================
+# PEFT PARAMETERS
+# ============================================================
+
 def validate_parameters(parameters, allowed_targets):
     """
-    Returns:
-      valid
-      full_model_artifact
-      trainable_names
-      trainable_count
+    A parameter is trainable iff:
+      - target is one of allowedTargets
+      - name ends in .lora_A.weight or .lora_B.weight
+
+    Other valid parameters may exist and are frozen.
     """
 
     if not isinstance(parameters, list):
-        return False, False, [], 0
+        return False, [], 0
 
     if not isinstance(allowed_targets, list):
-        return False, False, [], 0
+        return False, [], 0
 
-    # Allowed targets must be non-empty unique strings.
     if len(allowed_targets) == 0:
-        return False, False, [], 0
+        return False, [], 0
 
     if any(
-        not isinstance(x, str) or x == ""
-        for x in allowed_targets
+        not isinstance(target, str) or target == ""
+        for target in allowed_targets
     ):
-        return False, False, [], 0
+        return False, [], 0
 
     if len(set(allowed_targets)) != len(allowed_targets):
-        return False, False, [], 0
+        return False, [], 0
 
     allowed = set(allowed_targets)
+    seen_names = set()
 
-    names_seen = set()
+    for parameter in parameters:
+        if not isinstance(parameter, dict):
+            return False, [], 0
 
-    for p in parameters:
-        if not isinstance(p, dict):
-            return False, False, [], 0
-
-        if set(p.keys()) != {
+        if set(parameter.keys()) != {
             "name",
             "target",
             "numel",
         }:
-            return False, False, [], 0
+            return False, [], 0
 
-        name = p["name"]
-        target = p["target"]
-        numel = p["numel"]
+        name = parameter["name"]
+        target = parameter["target"]
+        numel = parameter["numel"]
 
         if not isinstance(name, str) or name == "":
-            return False, False, [], 0
+            return False, [], 0
 
         if not isinstance(target, str) or target == "":
-            return False, False, [], 0
+            return False, [], 0
 
         if not positive_safe_int(numel):
-            return False, False, [], 0
+            return False, [], 0
 
-        if name in names_seen:
-            return False, False, [], 0
+        if name in seen_names:
+            return False, [], 0
 
-        names_seen.add(name)
+        seen_names.add(name)
 
-    # A parameter is trainable iff BOTH conditions hold:
-    #   1. target is explicitly allowed
-    #   2. parameter is a LoRA A/B weight
     trainable = []
 
-    for p in parameters:
-        is_lora_weight = (
-            p["name"].endswith(".lora_A.weight")
-            or p["name"].endswith(".lora_B.weight")
+    for parameter in parameters:
+        name = parameter["name"]
+        target = parameter["target"]
+
+        lora_weight = (
+            name.endswith(".lora_A.weight")
+            or name.endswith(".lora_B.weight")
         )
 
-        if p["target"] in allowed and is_lora_weight:
-            trainable.append(p)
+        if target in allowed and lora_weight:
+            trainable.append(parameter)
 
-    # At least one actual LoRA parameter is mandatory.
     if not trainable:
-        return False, False, [], 0
-
-    # If a parameter for an allowed target is not a LoRA A/B
-    # parameter, this represents an attempt to train the base
-    # model rather than only PEFT adapters.
-    full_model = any(
-        p["target"] in allowed
-        and not (
-            p["name"].endswith(".lora_A.weight")
-            or p["name"].endswith(".lora_B.weight")
-        )
-        for p in parameters
-    )
+        return False, [], 0
 
     trainable.sort(
         key=lambda p: p["name"].encode("utf-8")
@@ -420,123 +364,160 @@ def validate_parameters(parameters, allowed_targets):
 
     count = 0
 
-    for p in trainable:
-        n = p["numel"]
+    for parameter in trainable:
+        numel = parameter["numel"]
 
-        # Safe integer accumulation.
-        if count > SAFE_MAX - n:
-            return False, full_model, [], 0
+        if count > SAFE_MAX - numel:
+            return False, [], 0
 
-        count += n
+        count += numel
 
     return (
-        not full_model,
-        full_model,
+        True,
         [p["name"] for p in trainable],
         count,
     )
 
 
+# ============================================================
+# ADAPTER FILES
+# ============================================================
+
 def validate_adapter_files(files):
-    required = [
+    required = {
         "adapter_config.json",
         "adapter_model.safetensors",
-    ]
+    }
 
     if not isinstance(files, list):
         return False, []
 
-    # Exactly two entries.
     if len(files) != 2:
-        return False, utf8_sort(
-            [x for x in files if isinstance(x, str)]
-        )
+        return False, []
 
     if any(not isinstance(x, str) for x in files):
         return False, []
 
-    # Exactly once each.
-    if (
-        files.count("adapter_config.json") != 1
-        or files.count("adapter_model.safetensors") != 1
-    ):
-        return False, utf8_sort(files)
+    # Exactly once each; no extras or duplicates.
+    if set(files) != required:
+        return False, []
 
-    ordered = utf8_sort(files)
+    if files.count("adapter_config.json") != 1:
+        return False, []
 
-    return True, ordered
+    if files.count("adapter_model.safetensors") != 1:
+        return False, []
 
+    return True, sorted(
+        files,
+        key=lambda x: x.encode("utf-8"),
+    )
+
+
+# ============================================================
+# CHECKPOINT
+# ============================================================
+
+def validate_checkpoint(checkpoint):
+    if not isinstance(checkpoint, dict):
+        return False
+
+    required = {
+        "model",
+        "optimizer",
+        "scheduler",
+        "step",
+        "rng",
+        "dataPosition",
+    }
+
+    return required.issubset(set(checkpoint.keys()))
+
+
+# ============================================================
+# LINEAGE
+# ============================================================
 
 def validate_lineage(body):
-    base = body.get("baseRevision")
-    dataset = body.get("datasetDigest")
-    code = body.get("codeDigest")
-    config = body.get("configDigest")
+    base_revision = body.get("baseRevision")
+    dataset_digest = body.get("datasetDigest")
+    code_digest = body.get("codeDigest")
+    config_digest = body.get("configDigest")
     expected = body.get("expectedDigests")
 
     base_ok = (
-        isinstance(base, str)
-        and HEX40.fullmatch(base) is not None
-    )
-
-    digests_ok = all(
-        isinstance(x, str)
-        and HEX64.fullmatch(x) is not None
-        for x in (
-            dataset,
-            code,
-            config,
-        )
+        isinstance(base_revision, str)
+        and HEX40.fullmatch(base_revision) is not None
     )
 
     if not base_ok:
         return False, True
 
+    digest_values = (
+        dataset_digest,
+        code_digest,
+        config_digest,
+    )
+
+    digests_ok = all(
+        isinstance(value, str)
+        and HEX64.fullmatch(value) is not None
+        for value in digest_values
+    )
+
     if not digests_ok:
         return False, False
 
-    # expectedDigests is an evidence object. If supplied, all
-    # expected lineage values must agree with the request.
     if not isinstance(expected, dict):
         return False, False
 
     for key, actual in (
-        ("datasetDigest", dataset),
-        ("codeDigest", code),
-        ("configDigest", config),
+        ("datasetDigest", dataset_digest),
+        ("codeDigest", code_digest),
+        ("configDigest", config_digest),
     ):
         if key not in expected:
             return False, False
 
         expected_value = expected[key]
 
-        if (
-            not isinstance(expected_value, str)
-            or HEX64.fullmatch(expected_value) is None
-            or expected_value != actual
-        ):
+        if not isinstance(expected_value, str):
+            return False, False
+
+        if HEX64.fullmatch(expected_value) is None:
+            return False, False
+
+        if expected_value != actual:
             return False, False
 
     return True, False
 
 
-def validate_batch(body):
-    mb = body.get("microBatch")
-    ga = body.get("gradientAccumulation")
+# ============================================================
+# EFFECTIVE BATCH
+# ============================================================
+
+def validate_effective_batch(body):
+    micro_batch = body.get("microBatch")
+    accumulation = body.get("gradientAccumulation")
     replicas = body.get("replicas")
     expected = body.get("expectedEffectiveBatch")
 
     if not all(
         positive_safe_int(x)
-        for x in (mb, ga, replicas, expected)
+        for x in (
+            micro_batch,
+            accumulation,
+            replicas,
+            expected,
+        )
     ):
         return False
 
-    # Avoid unsafe multiplication before comparing.
-    if mb > SAFE_MAX // ga:
+    if micro_batch > SAFE_MAX // accumulation:
         return False
 
-    product = mb * ga
+    product = micro_batch * accumulation
 
     if product > SAFE_MAX // replicas:
         return False
@@ -546,40 +527,47 @@ def validate_batch(body):
     return product == expected
 
 
-def validate_eval(body):
-    train = body.get("trainRowIds")
-    evaluation = body.get("evalRowIds")
+# ============================================================
+# EVALUATION ISOLATION
+# ============================================================
 
-    valid_lists = (
-        isinstance(train, list)
-        and isinstance(evaluation, list)
-        and len(train) > 0
-        and len(evaluation) > 0
-    )
+def validate_eval_isolation(body):
+    train_ids = body.get("trainRowIds")
+    eval_ids = body.get("evalRowIds")
 
-    if not valid_lists:
+    if not isinstance(train_ids, list):
+        return False
+
+    if not isinstance(eval_ids, list):
+        return False
+
+    if len(train_ids) == 0 or len(eval_ids) == 0:
         return False
 
     if any(
         not isinstance(x, str) or x == ""
-        for x in train
+        for x in train_ids
     ):
         return False
 
     if any(
         not isinstance(x, str) or x == ""
-        for x in evaluation
+        for x in eval_ids
     ):
         return False
 
-    if len(set(train)) != len(train):
+    if len(set(train_ids)) != len(train_ids):
         return False
 
-    if len(set(evaluation)) != len(evaluation):
+    if len(set(eval_ids)) != len(eval_ids):
         return False
 
-    return set(train).isdisjoint(set(evaluation))
+    return set(train_ids).isdisjoint(set(eval_ids))
 
+
+# ============================================================
+# RESUME
+# ============================================================
 
 def validate_resume(body):
     uninterrupted = body.get("uninterruptedWeights")
@@ -602,7 +590,10 @@ def validate_resume(body):
         return False
 
     for a, b in zip(uninterrupted, resumed):
-        if not finite_number(a) or not finite_number(b):
+        if not finite_number(a):
+            return False
+
+        if not finite_number(b):
             return False
 
         if abs(float(a) - float(b)) > float(tolerance):
@@ -611,16 +602,22 @@ def validate_resume(body):
     return True
 
 
+# ============================================================
+# REPAIR
+# ============================================================
+
 def repair(body):
     reasons = []
 
-    # Tokens
-    token_ok, labels = validate_tokens(body.get("tokens"))
+    # Tokenization / loss labels
+    token_pass, labels = validate_tokens(
+        body.get("tokens")
+    )
 
-    if not token_ok:
+    if not token_pass:
         reasons.append("INVALID_TOKEN")
 
-    # Template
+    # Exactly one chat template application
     template_pass = (
         body.get("templateApplications") == 1
     )
@@ -628,54 +625,40 @@ def repair(body):
     if not template_pass:
         reasons.append("CHAT_TEMPLATE_COUNT")
 
-    # Inference
-    inference_ok = (
+    # Must be training mode
+    inference_pass = (
         body.get("inferenceMode") is False
     )
 
-    if not inference_ok:
+    if not inference_pass:
         reasons.append("INFERENCE_MODE")
 
     # PEFT parameters
-    parameter_ok, full_model, trainable_params, trainable_count = (
+    parameter_pass, trainable_params, trainable_count = (
         validate_parameters(
             body.get("parameters"),
             body.get("allowedTargets"),
         )
     )
 
-    if not parameter_ok:
+    if not parameter_pass:
         reasons.append("INVALID_PARAMETER")
 
-    if full_model:
-        reasons.append("FULL_MODEL_ARTIFACT")
+    # The supplied parameter inventory is considered a PEFT
+    # configuration when valid and contains actual LoRA params.
+    peft_config_pass = parameter_pass
 
-    peft_config_pass = parameter_ok
-
-    # Adapter files
-    adapter_ok, adapter_files = validate_adapter_files(
+    # Adapter artifacts
+    adapter_pass, adapter_files = validate_adapter_files(
         body.get("artifactFiles")
     )
 
-    if not adapter_ok:
+    if not adapter_pass:
         reasons.append("ADAPTER_FILE_SET")
 
     # Checkpoint
-    checkpoint = body.get("checkpoint")
-
-    checkpoint_complete = (
-        isinstance(checkpoint, dict)
-        and all(
-            k in checkpoint
-            for k in (
-                "model",
-                "optimizer",
-                "scheduler",
-                "step",
-                "rng",
-                "dataPosition",
-            )
-        )
+    checkpoint_complete = validate_checkpoint(
+        body.get("checkpoint")
     )
 
     if not checkpoint_complete:
@@ -690,18 +673,18 @@ def repair(body):
         reasons.append("LINEAGE_MISMATCH")
 
     # Effective batch
-    batch_pass = validate_batch(body)
+    effective_batch_pass = validate_effective_batch(body)
 
-    if not batch_pass:
+    if not effective_batch_pass:
         reasons.append("EFFECTIVE_BATCH_MISMATCH")
 
-    # Evaluation isolation
-    eval_isolated = validate_eval(body)
+    # Train/eval row isolation
+    eval_isolated = validate_eval_isolation(body)
 
     if not eval_isolated:
         reasons.append("EVAL_LEAKAGE")
 
-    # Evaluation dropout
+    # Dropout must be inactive during evaluation
     dropout_ok = (
         body.get("dropoutActiveDuringEval") is False
     )
@@ -713,7 +696,7 @@ def repair(body):
         eval_isolated and dropout_ok
     )
 
-    # Resume
+    # Resume equivalence
     resume_pass = validate_resume(body)
 
     if not resume_pass:
@@ -731,13 +714,13 @@ def repair(body):
         "evalIsolated": eval_isolated,
         "evaluationDeterministic": evaluation_deterministic,
         "resumePass": resume_pass,
-        "reasonCodes": unique_utf8(reasons),
+        "reasonCodes": utf8_sort(reasons),
     }
 
 
-# ---------------------------------------------------------
+# ============================================================
 # ENDPOINT
-# ---------------------------------------------------------
+# ============================================================
 
 @app.post("/adapt")
 async def adapt(request: Request):
@@ -758,7 +741,7 @@ async def adapt(request: Request):
     operation = body.get("operation")
 
     if operation == "choose":
-        result = await choose(body)
+        result = choose(body)
 
         if result is None:
             return JSONResponse(
@@ -769,7 +752,9 @@ async def adapt(request: Request):
         return JSONResponse(content=result)
 
     if operation == "repair":
-        return JSONResponse(content=repair(body))
+        return JSONResponse(
+            content=repair(body)
+        )
 
     return JSONResponse(
         status_code=400,
